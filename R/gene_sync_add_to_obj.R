@@ -1,4 +1,4 @@
-# gene_sync_add_to_obj 函数 v3.2.0
+# gene_sync_add_to_obj 函数 v3.2.1
 # 主要更改：
 # 1. 添加 from/to 参数，支持多种输入格式
 # 2. 添加 update_features 参数（默认 TRUE）
@@ -6,6 +6,8 @@
 # 4. 添加 duplication 列（yes/no）
 # 5. 根据检测率处理重复基因
 # 6. 兼容 Seurat V4 和 V5（V5 不支持 drop 参数）
+# 7. 修复 Seurat V5 兼容性问题（使用 layer 替代 slot）
+# 8. 改进版本检测逻辑，正确处理 Seurat V5 的 layers
 
 #' Sync Gene Names in Seurat Object
 #'
@@ -211,8 +213,71 @@ gene_sync_add_to_obj <- function(object,
       dup_inputs <- intersect(dup_inputs, rownames(object))
 
       if (length(dup_inputs) > 0) {
-        # 使用 GetAssayData 获取表达数据
-        expr_mat <- Seurat::GetAssayData(object, slot = "data")[dup_inputs, , drop = FALSE]
+        # 使用 GetAssayData 获取表达数据 (V4/V5 兼容)
+        # 检测实际对象的类型，而不是包版本
+        default_assay <- Seurat::DefaultAssay(object)
+        assay_obj <- object[[default_assay]]
+
+        # 改进的 Seurat V5 检测逻辑
+        seurat_v5 <- tryCatch({
+          # V5 有 @layers 且非空，V4 有 @slots
+          has_layers <- !is.null(assay_obj@layers) && length(assay_obj@layers) > 0
+          # 额外检查：V5 的 @layers 是一个列表，V4 没有
+          if (has_layers && is.list(assay_obj@layers)) {
+            TRUE
+          } else {
+            FALSE
+          }
+        }, error = function(e) {
+          FALSE
+        })
+
+        # 获取表达数据
+        expr_mat <- NULL
+        if (seurat_v5) {
+          # Seurat V5: 使用 layer 参数，找到可用的 layer
+          layer_names <- names(assay_obj@layers)
+          # 在 Seurat V5 中，数据通常在 "data" layer，但也可能在其他 layer
+          # 检查哪个 layer 包含数据
+          for (target_layer in c("data", "counts", "scale.data")) {
+            if (target_layer %in% layer_names) {
+              tryCatch({
+                layer_data <- assay_obj@layers[[target_layer]]
+                if (!is.null(layer_data) && nrow(layer_data) > 0) {
+                  # 直接从 layer 获取数据，避免 drop 参数问题
+                  expr_mat <- layer_data[dup_inputs, , drop = FALSE]
+                  break
+                }
+              }, error = function(e) {
+                # 尝试下一个 layer
+              })
+            }
+          }
+          # 如果所有 layer 都失败，尝试使用 GetAssayData
+          if (is.null(expr_mat)) {
+            tryCatch({
+              expr_mat <- Seurat::GetAssayData(object, layer = layer_names[1])
+              if (!is.null(dup_inputs) && length(dup_inputs) > 0) {
+                expr_mat <- expr_mat[dup_inputs, , drop = FALSE]
+              }
+            }, error = function(e) {
+              if (verbose) cat("  Warning: Could not extract expression data:", conditionMessage(e), "\n")
+            })
+          }
+        } else {
+          # Seurat V4: 使用 slot 参数
+          tryCatch({
+            expr_mat <- Seurat::GetAssayData(object, slot = "data")[dup_inputs, , drop = FALSE]
+          }, error = function(e) {
+            if (verbose) cat("  Warning: 'data' slot not available, trying 'counts'...\n")
+            tryCatch({
+              expr_mat <- Seurat::GetAssayData(object, slot = "counts")[dup_inputs, , drop = FALSE]
+            }, error = function(e2) {
+              if (verbose) cat("  Error: Could not extract expression data:", conditionMessage(e2), "\n")
+            })
+          })
+        }
+
         mean_exp <- Matrix::rowMeans(expr_mat)
         detect_rate <- Matrix::rowMeans(expr_mat > 0)
 
@@ -304,19 +369,56 @@ gene_sync_add_to_obj <- function(object,
       # Get the default assay
       default_assay <- DefaultAssay(object)
 
-      # Detect Seurat version by package version, not by assay class
-      seurat_v5 <- tryCatch(
-        packageVersion("Seurat") >= "5.0.0",
-        error = function(e) FALSE
-      )
+      # Detect Seurat version by checking assay structure
+      # V5 has @layers, V4 has @counts/@data/@scale.data
+      assay_obj <- object[[default_assay]]
+      seurat_v5 <- tryCatch({
+        # V5 有 @layers 且非空，V4 有 @slots
+        has_layers <- !is.null(assay_obj@layers) && length(assay_obj@layers) > 0
+        # 额外检查：V5 的 @layers 是一个列表
+        if (has_layers && is.list(assay_obj@layers)) {
+          TRUE
+        } else {
+          FALSE
+        }
+      }, error = function(e) {
+        FALSE
+      })
+
+      if (verbose) {
+        if (seurat_v5) {
+          cat("  Detected Seurat V5 object (has layers)\n")
+        } else {
+          cat("  Detected Seurat V4 object (has counts/data/scale.data slots)\n")
+        }
+      }
 
       if (seurat_v5) {
         # Seurat V5: use layer-based approach
         if (verbose) cat("  Processing Seurat V5 object...\n")
 
         # Get layer names
-        layer_names <- names(object[[default_assay]]@layers)
+        layer_names <- names(assay_obj@layers)
         if (verbose) cat("  Found layers:", paste(layer_names, collapse = ", "), "\n")
+
+        # 在 Seurat V5 中，需要确保 genes_to_keep 在 layer 的行名中存在
+        # 先获取第一个 layer 的行名作为参考
+        first_layer_name <- layer_names[1]
+        first_layer <- assay_obj@layers[[first_layer_name]]
+        layer_features <- rownames(first_layer)
+
+        # 检查哪些 genes_to_keep 实际存在于 layer 中
+        genes_to_keep_valid <- intersect(genes_to_keep, layer_features)
+        if (length(genes_to_keep_valid) < length(genes_to_keep)) {
+          if (verbose) {
+            cat("  Note: Some genes not found in layers. Found:", length(genes_to_keep_valid),
+                "of", length(genes_to_keep), "\n")
+          }
+        }
+
+        # 调整 new_features 以匹配有效的基因
+        valid_idx <- match(genes_to_keep_valid, genes_to_keep)
+        new_features_valid <- new_features[valid_idx]
 
         # Create new layers list
         new_layers <- list()
@@ -324,18 +426,18 @@ gene_sync_add_to_obj <- function(object,
         for (layer_name in layer_names) {
           if (verbose) cat("  Processing layer:", layer_name, "...\n")
 
-          layer_data <- object[[default_assay]]@layers[[layer_name]]
+          layer_data <- assay_obj@layers[[layer_name]]
 
           if (!is.null(layer_data)) {
             if (verbose) cat("    Layer class:", class(layer_data)[1], "\n")
 
-            # Filter rows by genes_to_keep
+            # Filter rows by genes_to_keep_valid
             tryCatch({
               if (verbose) cat("    Subsetting layer...\n")
-              filtered_data <- layer_data[genes_to_keep, , drop = FALSE]
+              filtered_data <- layer_data[genes_to_keep_valid, , drop = FALSE]
 
               if (verbose) cat("    Renaming rows...\n")
-              rownames(filtered_data) <- new_features
+              rownames(filtered_data) <- new_features_valid
 
               new_layers[[layer_name]] <- filtered_data
               if (verbose) cat("    Layer done.\n")
@@ -349,10 +451,13 @@ gene_sync_add_to_obj <- function(object,
 
         # Update the assay
         if (verbose) cat("  Updating layers slot...\n")
-        object[[default_assay]]@layers <- new_layers
+        assay_obj@layers <- new_layers
 
         if (verbose) cat("  Updating features slot...\n")
-        object[[default_assay]]@features <- factor(new_features, levels = new_features)
+        assay_obj@features <- factor(new_features_valid, levels = new_features_valid)
+
+        # Assign back to object
+        object[[default_assay]] <- assay_obj
 
       } else {
         # Seurat V4: use subset then rename
