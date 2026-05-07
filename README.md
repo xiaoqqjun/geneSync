@@ -288,8 +288,7 @@ ortholog_db_info()
 If you use geneSync in your research, please cite:
 
 ```
-Feng Z (2026). geneSync: Gene Symbol and ID Conversion with Synonym Support.
-R package version 3.2.0. https://github.com/xiaoqqjun/geneSync
+Feng Z, Li T. Genesync: Gene Symbol Harmonization for Large-Scale Rna-Seq Data Integration. bioRxiv (2026):2026.05.04.722831. doi: 10.64898/2026.05.04.722831.
 ```
 
 ## Author
